@@ -1,7 +1,7 @@
-#include <HIDPowerDevice.h>		// https://github.com/abratchik/HIDPowerDevice
+#include <HIDPowerDevice.h>    // https://github.com/abratchik/HIDPowerDevice
 #include <SPI.h>
-#include <usbhub.h>				// https://github.com/felis/USB_Host_Shield_2.0
-#include <hiduniversal.h>		// https://github.com/felis/USB_Host_Shield_2.0
+#include <usbhub.h>       // https://github.com/felis/USB_Host_Shield_2.0
+#include <hiduniversal.h>   // https://github.com/felis/USB_Host_Shield_2.0
 
 #define MINUPDATEINTERVAL   26
 #define CHGDCHPIN           4
@@ -25,7 +25,7 @@ uint16_t iRunTimeToEmpty = 0;
 uint16_t iManufacturerDate = 0; // Initialized in setup()
 byte iFullChargeCapacity = 100;
 byte iRemaining = 100;
-int iRes = 0;
+bool externalUpsConnected = false;
 
 enum State {
   WAITING_FOR_EXTERNAL_UPS,
@@ -56,6 +56,8 @@ UPSReport latestUPS = {false, 100, 255}; // This is updated from parsing USB int
 class UPSParser : public HIDReportParser {
     void Parse(USBHID *hid, bool is_rpt_id, uint8_t len, uint8_t *buf) override {
       if (len < 6) return; // Ensure buffer has enough data
+
+      externalUpsConnected = true;
 
       latestUPS.onBattery = buf[5] == 0;
       latestUPS.charge = buf[2]; // Charge in %
@@ -88,11 +90,21 @@ void setup() {
   PowerDevice.setStringFeature(HID_PD_IDEVICECHEMISTRY, &bDeviceChemistry, STRING_DEVICECHEMISTRY);
   PowerDevice.setStringFeature(HID_PD_IOEMINFORMATION, &bOEMVendor, STRING_OEMVENDOR);
   PowerDevice.setFeature(HID_PD_FULLCHRGECAPACITY, &iFullChargeCapacity, sizeof(iFullChargeCapacity));
+
+  // This MUST be called, as it's different from the sendReport for HID_PD_REMAININGCAPACITY. Without this it will always be 0
   PowerDevice.setFeature(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
 
   uint16_t year = 2025, month = 10, day = 1;
   iManufacturerDate = (year - 1980) * 512 + month * 32 + day; // From 4.2.6 Battery Settings in "Universal Serial Bus Usage Tables for HID Power Devices"
   PowerDevice.setFeature(HID_PD_MANUFACTUREDATE, &iManufacturerDate, sizeof(iManufacturerDate));
+
+  // Initialize the UPS as if it was on AC with a full battery
+  iPresentStatus.Charging = true;
+  iPresentStatus.ACPresent = true;
+  iPresentStatus.FullyCharged = true;
+  iPresentStatus.Discharging = false;
+  iPresentStatus.BatteryPresent = 1;
+  PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
 
   if (Usb.Init() == -1) {
     Serial.println(F("USB Host Shield init failed"));
@@ -100,7 +112,6 @@ void setup() {
   }
 
   Hid.SetReportParser(0, &upsParser); // attach parser
-  delay(5000);
   Serial.println(F("UPS ready"));
 }
 
@@ -113,10 +124,35 @@ void loop() {
   switch (initialization_state) {
     case WAITING_FOR_EXTERNAL_UPS: {
 
-        // Send the latest values coming from the external UPS
-        sendToPC(newReport);
+        // Give it up to 5 seconds to get data from the external UPS...
+        if (millis() > 5000) {
+          if (externalUpsConnected == true) {
 
-        initialization_state = RUNNING;
+            Serial.println(F("UPS connected"));
+
+            // Send the latest values coming from the external UPS
+            sendToPC(newReport);
+
+            initialization_state = RUNNING;
+
+          } else { // If after waiting, were are still not able to get any data from the external UPS, assume it's not connected
+
+            Serial.println(F("UPS not connected"));
+
+            // Tell the host the UPS is not working by telling there is no charge remaining and no battery present
+            iPresentStatus.Charging = false;
+            iPresentStatus.ACPresent = false;
+            iPresentStatus.FullyCharged = false;
+            iPresentStatus.Discharging = true;
+            iPresentStatus.BatteryPresent = 0;
+            iRemaining = 0;
+
+            PowerDevice.sendReport(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
+            PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
+
+          }
+        }
+
         break;
       }
 
@@ -178,7 +214,7 @@ void sendToPC(UPSReport report) {
 
   PowerDevice.sendReport(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
   if (bDischarging) PowerDevice.sendReport(HID_PD_RUNTIMETOEMPTY, &iRunTimeToEmpty, sizeof(iRunTimeToEmpty));
-  iRes = PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
+  PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
 
   //Serial.println(iRemaining);
   //Serial.println(iRunTimeToEmpty);
