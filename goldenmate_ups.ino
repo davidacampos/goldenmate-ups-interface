@@ -69,6 +69,7 @@ class UPSParser : public HIDReportParser {
 UPSParser upsParser;
 
 void sendToPC(UPSReport report);
+void externalUpsDisconnected();
 
 void setup() {
 
@@ -137,19 +138,7 @@ void loop() {
 
           } else { // If after waiting, were are still not able to get any data from the external UPS, assume it's not connected
 
-            Serial.println(F("UPS not connected"));
-
-            // Tell the host the UPS is not working by telling there is no charge remaining and no battery present
-            iPresentStatus.Charging = false;
-            iPresentStatus.ACPresent = false;
-            iPresentStatus.FullyCharged = false;
-            iPresentStatus.Discharging = true;
-            iPresentStatus.BatteryPresent = 0;
-            iRemaining = 0;
-
-            PowerDevice.sendReport(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
-            PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
-
+            externalUpsDisconnected();
           }
         }
 
@@ -158,32 +147,39 @@ void loop() {
 
     case RUNNING: {
 
-        // Check if battery or charge status changed
-        if ((newReport.onBattery != currentUPS.onBattery) || (newReport.charge != currentUPS.charge)) {
-          currentUPS = newReport;
+        if (Usb.getUsbTaskState() == USB_STATE_RUNNING) {
 
-          if (newReport.onBattery) {
-            // In a few seconds, confirm if it's still "on battery", to debounce "false on battery" messages coming from the UPS
-            pendingBattery = true;
-            batteryChangeStart = millis();
-          } else {
-            // Back to AC immediately
-            filteredUPS = newReport;
-            sendToPC(filteredUPS);
+          // Check if battery or charge status changed
+          if ((newReport.onBattery != currentUPS.onBattery) || (newReport.charge != currentUPS.charge)) {
+            currentUPS = newReport;
+
+            if (newReport.onBattery) {
+              // In a few seconds, confirm if it's still "on battery", to debounce "false on battery" messages coming from the UPS
+              pendingBattery = true;
+              batteryChangeStart = millis();
+            } else {
+              // Back to AC immediately
+              filteredUPS = newReport;
+              sendToPC(filteredUPS);
+              pendingBattery = false;
+            }
+          }
+
+          // If pending battery, check debounce
+          if (pendingBattery && millis() - batteryChangeStart >= 2000) {
+            if (latestUPS.onBattery) {
+              filteredUPS = latestUPS;
+              sendToPC(filteredUPS);
+            }
             pendingBattery = false;
           }
-        }
 
-        // If pending battery, check debounce
-        if (pendingBattery && millis() - batteryChangeStart >= 2000) {
-          if (latestUPS.onBattery) {
-            filteredUPS = latestUPS;
-            sendToPC(filteredUPS);
-          }
-          pendingBattery = false;
+          break;
+          
+        } else {
+          Serial.println(F("No external USB connected"));
+          externalUpsDisconnected();
         }
-
-        break;
       }
   }
 }
@@ -218,4 +214,20 @@ void sendToPC(UPSReport report) {
 
   //Serial.println(iRemaining);
   //Serial.println(iRunTimeToEmpty);
+}
+
+// --- Tells PC the UPS is "disconnected" ---
+void externalUpsDisconnected() {
+  Serial.println(F("UPS not connected"));
+
+  // Tell the host the UPS is not working by telling there is no charge remaining and no battery present
+  iPresentStatus.Charging = false;
+  iPresentStatus.ACPresent = false;
+  iPresentStatus.FullyCharged = false;
+  iPresentStatus.Discharging = true;
+  iPresentStatus.BatteryPresent = 0;
+  iRemaining = 0;
+
+  PowerDevice.sendReport(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
+  PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
 }
