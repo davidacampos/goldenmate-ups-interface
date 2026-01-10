@@ -2,6 +2,7 @@
 #include <SPI.h>
 #include <usbhub.h>       // https://github.com/felis/USB_Host_Shield_2.0
 #include <hiduniversal.h>   // https://github.com/felis/USB_Host_Shield_2.0
+#include <avr/wdt.h>
 
 #define MINUPDATEINTERVAL   26
 #define CHGDCHPIN           4
@@ -26,6 +27,8 @@ uint16_t iManufacturerDate = 0; // Initialized in setup()
 byte iFullChargeCapacity = 100;
 byte iRemaining = 100;
 bool externalUpsConnected = false;
+
+unsigned long start;
 
 enum State {
   WAITING_FOR_EXTERNAL_UPS,
@@ -73,7 +76,12 @@ void externalUpsDisconnected();
 
 void setup() {
 
+  MCUSR &= ~(1<<WDRF); // Clear any previous WDT reset
+  wdt_disable(); // Disable watchdog while booting/uploading
+
   Serial.begin(115200);
+
+  start = millis();
 
   // Start UPS interface with host machine
   PowerDevice.begin();
@@ -112,11 +120,23 @@ void setup() {
     while (1);
   }
 
-  Hid.SetReportParser(0, &upsParser); // attach parser
+  Hid.SetReportParser(0, &upsParser); // Attach parser
   Serial.println(F("UPS ready"));
+
+  delay(1000);
+  wdt_enable(WDTO_8S); // Enable watchdog for every 8 seconds
+
 }
 
 void loop() {
+
+  wdt_reset(); // Call the watchdog to avoid the device's auto reset. This needs to be called at least every 8 seconds to avoid auto resetting the device
+
+  // After ~24 hours of uptime, lock the loop that way wdt_reset() is no longer called, causing the watchdog to reset the Arduino
+  if (millis() - start >= 86400000UL) {
+    Serial.println(F("Auto-resetting Arduino device..."));
+    while (1);
+  }
 
   Usb.Task();
 
@@ -147,7 +167,14 @@ void loop() {
 
     case RUNNING: {
 
-        if (Usb.getUsbTaskState() == USB_STATE_RUNNING) {
+        uint8_t usbState = Usb.getUsbTaskState();
+
+        if (usbState == USB_STATE_DETACHED) {
+          Serial.println(F("No external USB device connected"));
+          externalUpsDisconnected();
+          initialization_state = WAITING_FOR_EXTERNAL_UPS;
+
+        } else {
 
           // Check if battery or charge status changed
           if ((newReport.onBattery != currentUPS.onBattery) || (newReport.charge != currentUPS.charge)) {
@@ -173,13 +200,9 @@ void loop() {
             }
             pendingBattery = false;
           }
-
-          break;
-          
-        } else {
-          Serial.println(F("No external UPS connected"));
-          externalUpsDisconnected();
         }
+
+        break;
       }
   }
 }
