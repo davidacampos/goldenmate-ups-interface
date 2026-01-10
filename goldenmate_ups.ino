@@ -177,7 +177,7 @@ void loop() {
           break;
           
         } else {
-          Serial.println(F("No external USB connected"));
+          Serial.println(F("No external UPS connected"));
           externalUpsDisconnected();
         }
       }
@@ -230,4 +230,6 @@ void externalUpsDisconnected() {
 
   PowerDevice.sendReport(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
   PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
+
+  delay(1000); // Wait 1 second before continuing execution...
 }
