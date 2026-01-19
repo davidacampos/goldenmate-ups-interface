@@ -27,6 +27,7 @@ uint16_t iManufacturerDate = 0; // Initialized in setup()
 byte iFullChargeCapacity = 100;
 byte iRemaining = 100;
 bool externalUpsConnected = false;
+bool firstHidReportComplete = false;
 
 unsigned long start;
 
@@ -40,9 +41,15 @@ State initialization_state = WAITING_FOR_EXTERNAL_UPS;
 USB Usb;
 HIDUniversal Hid(&Usb);
 
-// Debounce variables
-unsigned long batteryChangeStart = 0;
-bool pendingBattery = false;
+// Debounce variables for initial event
+unsigned long upsStableSince = 0;
+bool isUpsStateStable = false;
+const unsigned long UPS_STABLE_DEBOUNCE_TIME_MS = 2000;
+
+// Debounce variables for constant events
+unsigned long batteryChangeSince = 0;
+bool isBatteryChangePending = false;
+const unsigned long UPS_BATTERY_CHANGE_DEBOUNCE_TIME_MS = 2000;
 
 // UPS state
 struct UPSReport {
@@ -60,12 +67,18 @@ class UPSParser : public HIDReportParser {
     void Parse(USBHID *hid, bool is_rpt_id, uint8_t len, uint8_t *buf) override {
       if (len < 6) return; // Ensure buffer has enough data
 
-      externalUpsConnected = true;
+      if (firstHidReportComplete == true) {
 
-      latestUPS.onBattery = buf[5] == 0;
-      latestUPS.charge = buf[2]; // Charge in %
-      latestUPS.load = buf[4]; // Load in Watts, only when in battery mode
-      if (latestUPS.charge == 99) latestUPS.charge = 100; // Normalize charge as the UPS commonly stays at 99% instead of hitting 100%
+        latestUPS.onBattery = buf[5] == 0;
+        latestUPS.charge = buf[2]; // Charge in %
+        latestUPS.load = buf[4]; // Load in Watts, only when in battery mode
+        if (latestUPS.charge == 99) latestUPS.charge = 100; // Normalize charge as the UPS commonly stays at 99% instead of hitting 100%
+        
+        externalUpsConnected = true;
+  
+      } else {
+        firstHidReportComplete = true; // Ignore the first HID report, as it seems it's reporting "on battery" for an instant even if "on AC"
+      }
     }
 };
 
@@ -108,11 +121,11 @@ void setup() {
   PowerDevice.setFeature(HID_PD_MANUFACTUREDATE, &iManufacturerDate, sizeof(iManufacturerDate));
 
   // Initialize the UPS as if it was on AC with a full battery
-  iPresentStatus.Charging = true;
-  iPresentStatus.ACPresent = true;
-  iPresentStatus.FullyCharged = true;
-  iPresentStatus.Discharging = false;
+  iPresentStatus.Charging = 1;
+  iPresentStatus.Discharging = 0;
+  iPresentStatus.ACPresent = 1;
   iPresentStatus.BatteryPresent = 1;
+  iPresentStatus.FullyCharged = 1;
   PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
 
   if (Usb.Init() == -1) {
@@ -145,16 +158,41 @@ void loop() {
   switch (initialization_state) {
     case WAITING_FOR_EXTERNAL_UPS: {
 
-        // Give it up to 5 seconds to get data from the external UPS...
-        if (millis() > 5000) {
+        // Give it up to 30 seconds to get data from the external UPS...
+        if (millis() > 30000) {
           if (externalUpsConnected == true) {
 
             Serial.println(F("UPS connected"));
 
-            // Send the latest values coming from the external UPS
-            sendToPC(newReport);
+            // Wait until UPS state is stable before reporting
+            if (!isUpsStateStable) {
+              if (newReport.onBattery == filteredUPS.onBattery && newReport.charge == filteredUPS.charge) {
+            
+                if (upsStableSince == 0) {
+                  upsStableSince = millis();
+                }
+            
+                if (millis() - upsStableSince >= UPS_STABLE_DEBOUNCE_TIME_MS) {
 
-            initialization_state = RUNNING;
+                  Serial.println(F("UPS connected and stable. Reporting first real status"));
+                  
+                  isUpsStateStable = true;
+
+                  // Send the latest values coming from the external UPS
+                  sendToPC(newReport);
+                  initialization_state = RUNNING;
+                }
+            
+              } else {
+
+                Serial.println(F("UPS connected but not stable"));
+                
+                // Reset stabilization timer
+                filteredUPS = newReport;
+                upsStableSince = 0;
+              }
+            }
+
 
           } else { // If after waiting, were are still not able to get any data from the external UPS, assume it's not connected
 
@@ -182,23 +220,23 @@ void loop() {
 
             if (newReport.onBattery) {
               // In a few seconds, confirm if it's still "on battery", to debounce "false on battery" messages coming from the UPS
-              pendingBattery = true;
-              batteryChangeStart = millis();
+              isBatteryChangePending = true;
+              batteryChangeSince = millis();
             } else {
               // Back to AC immediately
               filteredUPS = newReport;
               sendToPC(filteredUPS);
-              pendingBattery = false;
+              isBatteryChangePending = false;
             }
           }
 
           // If pending battery, check debounce
-          if (pendingBattery && millis() - batteryChangeStart >= 2000) {
+          if (isBatteryChangePending && millis() - batteryChangeSince >= UPS_BATTERY_CHANGE_DEBOUNCE_TIME_MS) {
             if (latestUPS.onBattery) {
               filteredUPS = latestUPS;
               sendToPC(filteredUPS);
             }
-            pendingBattery = false;
+            isBatteryChangePending = false;
           }
         }
 
@@ -244,10 +282,10 @@ void externalUpsDisconnected() {
   Serial.println(F("UPS not connected"));
 
   // Tell the host the UPS is not working by telling there is no charge remaining and no battery present
-  iPresentStatus.Charging = false;
-  iPresentStatus.ACPresent = false;
-  iPresentStatus.FullyCharged = false;
-  iPresentStatus.Discharging = true;
+  iPresentStatus.Charging = 0;
+  iPresentStatus.ACPresent = 0;
+  iPresentStatus.FullyCharged = 0;
+  iPresentStatus.Discharging = 0;
   iPresentStatus.BatteryPresent = 0;
   iRemaining = 0;
 
