@@ -168,7 +168,7 @@ void loop() {
         if (millis() > 30000) {
           if (externalUpsConnected == true) {
 
-            Serial.println(F("UPS connected"));
+            Serial.println(F("External UPS connected"));
 
             // Wait until UPS state is stable before reporting
             if (!isUpsStateStable) {
@@ -180,7 +180,7 @@ void loop() {
 
                 if (millis() - upsStableSince >= UPS_STABLE_DEBOUNCE_TIME_MS) {
 
-                  Serial.println(F("UPS connected and stable. Reporting first real status"));
+                  Serial.println(F("External UPS connected and stable. Reporting first real status"));
 
                   isUpsStateStable = true;
 
@@ -191,7 +191,7 @@ void loop() {
 
               } else {
 
-                Serial.println(F("UPS connected but not stable"));
+                Serial.println(F("External UPS connected but not stable"));
 
                 // Reset stabilization timer
                 filteredUPS = newReport;
@@ -214,7 +214,7 @@ void loop() {
         uint8_t usbState = Usb.getUsbTaskState();
 
         if (millis() - upsLastReportSince >= 300000) {
-          Serial.println(F("No UPS report in 5 min. Will trigger an Arduino reset"));
+          Serial.println(F("No external UPS report in 5 min. Will trigger an Arduino reset"));
           forceReset = true;
         }
 
@@ -290,7 +290,7 @@ void sendToPC(UPSReport report) {
 
 // --- Tells PC the UPS is "disconnected" ---
 void externalUpsDisconnected() {
-  Serial.println(F("UPS not connected"));
+  Serial.println(F("External UPS not connected"));
 
   // Tell the host the UPS is not working by telling there is no charge remaining and no battery present
   iPresentStatus.Charging = 0;
