@@ -30,6 +30,7 @@ bool externalUpsConnected = false;
 bool firstHidReportComplete = false;
 
 unsigned long start;
+bool forceReset = false;
 
 enum State {
   WAITING_FOR_EXTERNAL_UPS,
@@ -51,6 +52,9 @@ unsigned long batteryChangeSince = 0;
 bool isBatteryChangePending = false;
 const unsigned long UPS_BATTERY_CHANGE_DEBOUNCE_TIME_MS = 2000;
 
+// These flags keep track on when was the last time particular events happened, to decide if the Arduino should be auto-reset
+unsigned long upsLastReportSince = 0;
+
 // UPS state
 struct UPSReport {
   bool onBattery;
@@ -67,15 +71,17 @@ class UPSParser : public HIDReportParser {
     void Parse(USBHID *hid, bool is_rpt_id, uint8_t len, uint8_t *buf) override {
       if (len < 6) return; // Ensure buffer has enough data
 
+      upsLastReportSince = millis();
+
       if (firstHidReportComplete == true) {
 
         latestUPS.onBattery = buf[5] == 0;
         latestUPS.charge = buf[2]; // Charge in %
         latestUPS.load = buf[4]; // Load in Watts, only when in battery mode
         if (latestUPS.charge == 99) latestUPS.charge = 100; // Normalize charge as the UPS commonly stays at 99% instead of hitting 100%
-        
+
         externalUpsConnected = true;
-  
+
       } else {
         firstHidReportComplete = true; // Ignore the first HID report, as it seems it's reporting "on battery" for an instant even if "on AC"
       }
@@ -89,7 +95,7 @@ void externalUpsDisconnected();
 
 void setup() {
 
-  MCUSR &= ~(1<<WDRF); // Clear any previous WDT reset
+  MCUSR &= ~(1 << WDRF); // Clear any previous WDT reset
   wdt_disable(); // Disable watchdog while booting/uploading
 
   Serial.begin(115200);
@@ -146,7 +152,7 @@ void loop() {
   wdt_reset(); // Call the watchdog to avoid the device's auto reset. This needs to be called at least every 8 seconds to avoid auto resetting the device
 
   // After ~24 hours of uptime, lock the loop that way wdt_reset() is no longer called, causing the watchdog to reset the Arduino
-  if (millis() - start >= 86400000UL) {
+  if ((millis() - start >= 86400000UL) || forceReset == true) {
     Serial.println(F("Auto-resetting Arduino device..."));
     while (1);
   }
@@ -167,26 +173,26 @@ void loop() {
             // Wait until UPS state is stable before reporting
             if (!isUpsStateStable) {
               if (newReport.onBattery == filteredUPS.onBattery && newReport.charge == filteredUPS.charge) {
-            
+
                 if (upsStableSince == 0) {
                   upsStableSince = millis();
                 }
-            
+
                 if (millis() - upsStableSince >= UPS_STABLE_DEBOUNCE_TIME_MS) {
 
                   Serial.println(F("UPS connected and stable. Reporting first real status"));
-                  
+
                   isUpsStateStable = true;
 
                   // Send the latest values coming from the external UPS
                   sendToPC(newReport);
                   initialization_state = RUNNING;
                 }
-            
+
               } else {
 
                 Serial.println(F("UPS connected but not stable"));
-                
+
                 // Reset stabilization timer
                 filteredUPS = newReport;
                 upsStableSince = 0;
@@ -206,6 +212,11 @@ void loop() {
     case RUNNING: {
 
         uint8_t usbState = Usb.getUsbTaskState();
+
+        if (millis() - upsLastReportSince >= 300000) {
+          Serial.println(F("No UPS report in 5 min. Will trigger an Arduino reset"));
+          forceReset = true;
+        }
 
         if (usbState == USB_STATE_DETACHED) {
           Serial.println(F("No external USB device connected"));
