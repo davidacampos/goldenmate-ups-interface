@@ -31,6 +31,7 @@ bool firstHidReportComplete = false;
 
 unsigned long start;
 bool forceReset = false;
+uint16_t externalUpsDisconnectedReportCount = 0;
 
 enum State {
   WAITING_FOR_EXTERNAL_UPS,
@@ -151,9 +152,9 @@ void loop() {
 
   wdt_reset(); // Call the watchdog to avoid the device's auto reset. This needs to be called at least every 8 seconds to avoid auto resetting the device
 
-  // After ~24 hours of uptime, lock the loop that way wdt_reset() is no longer called, causing the watchdog to reset the Arduino
-  if ((millis() - start >= 86400000UL) || forceReset == true) {
-    Serial.println(F("Auto-resetting Arduino device..."));
+  // Lock the loop that way wdt_reset() is no longer called, causing the watchdog to reset the Arduino
+  if (forceReset == true) {
+    Serial.println(F("Auto-resetting Arduino device in ~8 seconds..."));
     while (1);
   }
 
@@ -218,12 +219,7 @@ void loop() {
           forceReset = true;
         }
 
-        if (usbState == USB_STATE_DETACHED) {
-          Serial.println(F("No external USB device connected"));
-          externalUpsDisconnected();
-          initialization_state = WAITING_FOR_EXTERNAL_UPS;
-
-        } else {
+        if (usbState == USB_STATE_RUNNING) {
 
           // Check if battery or charge status changed
           if ((newReport.onBattery != currentUPS.onBattery) || (newReport.charge != currentUPS.charge)) {
@@ -249,6 +245,10 @@ void loop() {
             }
             isBatteryChangePending = false;
           }
+
+        } else {
+          Serial.println(F("No external USB device connected"));
+          externalUpsDisconnected();
         }
 
         break;
@@ -286,6 +286,8 @@ void sendToPC(UPSReport report) {
 
   //Serial.println(iRemaining);
   //Serial.println(iRunTimeToEmpty);
+
+  externalUpsDisconnectedReportCount = 0;
 }
 
 // --- Tells PC the UPS is "disconnected" ---
@@ -304,4 +306,10 @@ void externalUpsDisconnected() {
   PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
 
   delay(1000); // Wait 1 second before continuing execution...
+
+  // Count how many consecutive times (i.e. without sending a regular UPS report) the "disconnected" report has been sent to the host... to trigger an Arduino reset if needed
+  externalUpsDisconnectedReportCount = externalUpsDisconnectedReportCount + 1;
+  if (externalUpsDisconnectedReportCount >= 60) { // After 1 min of consecutive "disconnected" reports
+    forceReset = true;
+  }
 }
