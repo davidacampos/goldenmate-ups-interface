@@ -1,7 +1,7 @@
-#include <HIDPowerDevice.h>    // https://github.com/abratchik/HIDPowerDevice
+#include <HIDPowerDevice.h>   // https://github.com/abratchik/HIDPowerDevice
 #include <SPI.h>
-#include <usbhub.h>       // https://github.com/felis/USB_Host_Shield_2.0
-#include <hiduniversal.h>   // https://github.com/felis/USB_Host_Shield_2.0
+#include <usbhub.h>           // https://github.com/felis/USB_Host_Shield_2.0
+#include <hiduniversal.h>     // https://github.com/felis/USB_Host_Shield_2.0
 #include <avr/wdt.h>
 
 #define MINUPDATEINTERVAL   26
@@ -26,35 +26,16 @@ uint16_t iRunTimeToEmpty = 0;
 uint16_t iManufacturerDate = 0; // Initialized in setup()
 byte iFullChargeCapacity = 100;
 byte iRemaining = 100;
-bool externalUpsConnected = false;
-bool firstHidReportComplete = false;
 
-unsigned long start;
 bool forceReset = false;
+bool inititalStatusSentToHost = false;
+
+// These variables keep track on when was the last time particular events happened to decide if the Arduino should be auto-reset
 uint16_t externalUpsDisconnectedReportCount = 0;
-
-enum State {
-  WAITING_FOR_EXTERNAL_UPS,
-  RUNNING
-};
-
-State initialization_state = WAITING_FOR_EXTERNAL_UPS;
+unsigned long upsLastReportSince = 0; 
 
 USB Usb;
 HIDUniversal Hid(&Usb);
-
-// Debounce variables for initial event
-unsigned long upsStableSince = 0;
-bool isUpsStateStable = false;
-const unsigned long UPS_STABLE_DEBOUNCE_TIME_MS = 2000;
-
-// Debounce variables for constant events
-unsigned long batteryChangeSince = 0;
-bool isBatteryChangePending = false;
-const unsigned long UPS_BATTERY_CHANGE_DEBOUNCE_TIME_MS = 2000;
-
-// These flags keep track on when was the last time particular events happened, to decide if the Arduino should be auto-reset
-unsigned long upsLastReportSince = 0;
 
 // UPS state
 struct UPSReport {
@@ -63,36 +44,54 @@ struct UPSReport {
   uint8_t load; // Watts
 };
 
-UPSReport currentUPS = {false, 100, 0};
-UPSReport filteredUPS = {false, 100, 0};
-UPSReport latestUPS = {false, 100, 255}; // This is updated from parsing USB interface
+void sendToPC(UPSReport report);
+void externalUpsDisconnected();
+
+UPSReport previousUpsStatus = {false, 255, 255};
 
 // --- HID report parser ---
 class UPSParser : public HIDReportParser {
     void Parse(USBHID *hid, bool is_rpt_id, uint8_t len, uint8_t *buf) override {
+      UPSReport currentUpsStatus;
+
       if (len < 6) return; // Ensure buffer has enough data
 
       upsLastReportSince = millis();
 
-      if (firstHidReportComplete == true) {
+      currentUpsStatus.onBattery = buf[5] == 0;
+      currentUpsStatus.charge = buf[2]; // Charge in %
+      currentUpsStatus.load = buf[4]; // Load in Watts, only when in battery mode
+      if (currentUpsStatus.charge == 99) currentUpsStatus.charge = 100; // Normalize charge as the UPS commonly stays at 99% instead of hitting 100%
 
-        latestUPS.onBattery = buf[5] == 0;
-        latestUPS.charge = buf[2]; // Charge in %
-        latestUPS.load = buf[4]; // Load in Watts, only when in battery mode
-        if (latestUPS.charge == 99) latestUPS.charge = 100; // Normalize charge as the UPS commonly stays at 99% instead of hitting 100%
+      if (previousUpsStatus.charge != 255 && previousUpsStatus.load != 255) { // Check if previous status has been initialized
 
-        externalUpsConnected = true;
+        // The external UPS sends a status report every ~1sec, but it sometimes flaps so we want to submit the report to the host only after there are at least 2 consecutive values that are the same
+        if (currentUpsStatus.onBattery == previousUpsStatus.onBattery) {
 
+          // Send the "normalized" UPS status to host PC
+          sendToPC(currentUpsStatus);
+
+          if (inititalStatusSentToHost == false) {
+            Serial.println(F("External UPS initial status succesfully sent to host"));
+            inititalStatusSentToHost = true;
+          }
+
+        } else {
+          Serial.println(F("External UPS 'OnBattery' status changed but waiting for the next status update to confirm it was not only a flap..."));
+
+        }
       } else {
-        firstHidReportComplete = true; // Ignore the first HID report, as it seems it's reporting "on battery" for an instant even if "on AC"
+        Serial.println(F("External UPS status not yet defined"));
+
       }
+
+      // Keep track of current UPS status for next check
+      previousUpsStatus = currentUpsStatus;
+
     }
 };
 
 UPSParser upsParser;
-
-void sendToPC(UPSReport report);
-void externalUpsDisconnected();
 
 void setup() {
 
@@ -100,8 +99,6 @@ void setup() {
   wdt_disable(); // Disable watchdog while booting/uploading
 
   Serial.begin(115200);
-
-  start = millis();
 
   // Start UPS interface with host machine
   PowerDevice.begin();
@@ -159,101 +156,22 @@ void loop() {
   }
 
   Usb.Task();
+  uint8_t usbState = Usb.getUsbTaskState();
 
-  UPSReport newReport = latestUPS;
-
-  switch (initialization_state) {
-    case WAITING_FOR_EXTERNAL_UPS: {
-
-        // Give it up to 30 seconds to get data from the external UPS...
-        if (millis() > 30000) {
-          if (externalUpsConnected == true) {
-
-            Serial.println(F("External UPS connected"));
-
-            // Wait until UPS state is stable before reporting
-            if (!isUpsStateStable) {
-              if (newReport.onBattery == filteredUPS.onBattery && newReport.charge == filteredUPS.charge) {
-
-                if (upsStableSince == 0) {
-                  upsStableSince = millis();
-                }
-
-                if (millis() - upsStableSince >= UPS_STABLE_DEBOUNCE_TIME_MS) {
-
-                  Serial.println(F("External UPS connected and stable. Reporting first real status"));
-
-                  isUpsStateStable = true;
-
-                  // Send the latest values coming from the external UPS
-                  sendToPC(newReport);
-                  initialization_state = RUNNING;
-                }
-
-              } else {
-
-                Serial.println(F("External UPS connected but not stable"));
-
-                // Reset stabilization timer
-                filteredUPS = newReport;
-                upsStableSince = 0;
-              }
-            }
-
-
-          } else { // If after waiting, were are still not able to get any data from the external UPS, assume it's not connected
-
-            externalUpsDisconnected();
-          }
-        }
-
-        break;
-      }
-
-    case RUNNING: {
-
-        uint8_t usbState = Usb.getUsbTaskState();
-
-        if (millis() - upsLastReportSince >= 300000) {
-          Serial.println(F("No external UPS report in 5 min. Will trigger an Arduino reset"));
-          forceReset = true;
-        }
-
-        if (usbState == USB_STATE_RUNNING) {
-
-          // Check if battery or charge status changed
-          if ((newReport.onBattery != currentUPS.onBattery) || (newReport.charge != currentUPS.charge)) {
-            currentUPS = newReport;
-
-            if (newReport.onBattery) {
-              // In a few seconds, confirm if it's still "on battery", to debounce "false on battery" messages coming from the UPS
-              isBatteryChangePending = true;
-              batteryChangeSince = millis();
-            } else {
-              // Back to AC immediately
-              filteredUPS = newReport;
-              sendToPC(filteredUPS);
-              isBatteryChangePending = false;
-            }
-          }
-
-          // If pending battery, check debounce
-          if (isBatteryChangePending && millis() - batteryChangeSince >= UPS_BATTERY_CHANGE_DEBOUNCE_TIME_MS) {
-            if (latestUPS.onBattery) {
-              filteredUPS = latestUPS;
-              sendToPC(filteredUPS);
-            }
-            isBatteryChangePending = false;
-          }
-
-        } else {
-          Serial.println(F("No external USB device connected"));
-          externalUpsDisconnected();
-        }
-
-        break;
-      }
+  if (millis() - upsLastReportSince >= 300000) {
+    Serial.println(F("No external UPS report in 5 min. Will trigger an Arduino reset"));
+    forceReset = true;
   }
+
+  if (externalUpsDisconnectedReportCount >= 60) {
+    Serial.println(F("External UPS has been disconnected for 1 min. Will trigger an Arduino reset"));
+    forceReset = true;
+  }
+
+  if (usbState != USB_STATE_RUNNING) {
+    externalUpsDisconnected();
+  }
+
 }
 
 // --- Send UPS data to PC ---
@@ -292,7 +210,8 @@ void sendToPC(UPSReport report) {
 
 // --- Tells PC the UPS is "disconnected" ---
 void externalUpsDisconnected() {
-  Serial.println(F("External UPS not connected"));
+  Serial.print(F("External UPS not connected. USB status:"));
+  Serial.println(Usb.getUsbTaskState());
 
   // Tell the host the UPS is not working by telling there is no charge remaining and no battery present
   iPresentStatus.Charging = 0;
@@ -309,7 +228,4 @@ void externalUpsDisconnected() {
 
   // Count how many consecutive times (i.e. without sending a regular UPS report) the "disconnected" report has been sent to the host... to trigger an Arduino reset if needed
   externalUpsDisconnectedReportCount = externalUpsDisconnectedReportCount + 1;
-  if (externalUpsDisconnectedReportCount >= 60) { // After 1 min of consecutive "disconnected" reports
-    forceReset = true;
-  }
 }
